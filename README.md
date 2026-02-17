@@ -2,6 +2,12 @@
 
 A comparative benchmark of two attention mechanism architectures measuring throughput (tokens/sec), latency (ms), and peak GPU memory (MB) across varying sequence lengths.
 
+**Reference Implementations:**
+- GDN: [NVlabs/GatedDeltaNet](https://github.com/NVlabs/GatedDeltaNet) - `lit_gpt/gated_delta_net.py`, `lit_gpt/gated_delta_rule_ops/chunk.py`
+- GSA: [alfredcs/Gated-Sparse-Attention](https://github.com/alfredcs/Gated-Sparse-Attention) - `gsa/attention/gated_sparse_attention.py`, `gsa/kernels/`
+
+The benchmark implementations are aligned with these reference repos. Triton/CUDA kernels are replaced with equivalent PyTorch fallbacks for portability.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -19,10 +25,14 @@ A comparative benchmark of two attention mechanism architectures measuring throu
 
 | Model | Core Idea | Time Complexity | Memory Complexity |
 |-------|-----------|-----------------|-------------------|
-| **Gated DeltaNet (GDN)** | Recurrent state-space attention via delta rule | O(T * H * d^3) | O(H * d^2) state |
+| **Gated DeltaNet (GDN)** | Recurrent state-space attention via delta rule | O(T * H * d_k * d_v) | O(H * d_k * d_v) state |
 | **Gated Sparse Attention (GSA)** | Adaptive top-k sparse attention | O(T^2 * H_idx * d_idx) indexer + O(T * k * d) attention | O(T * k) indices |
 
-Where: `B` = batch, `T` = sequence length, `D` = hidden dimension, `H` = attention heads (16), `d` = head_dim (D/H = 128), `H_idx` = indexer heads (4), `d_idx` = indexer dim (32), `k` = adaptive sparsity budget (32-1024).
+Where: `B` = batch, `T` = sequence length, `D` = hidden dimension, `H` = attention heads (16), `d_k` = key head dim (`D*0.75/H` = 96), `d_v` = value head dim (`D*1.5/H` = 192), `H_idx` = indexer heads (4), `d_idx` = indexer dim (64), `k` = adaptive sparsity budget (256-4096).
+
+**Key reference-aligned parameters:**
+- GDN: `expand_k=0.75`, `expand_v=1.5`, Mamba-style gating, `recurrent_gated_delta_rule_ref` recurrence
+- GSA: `GatedLightningIndexer(d_indexer=64)`, `AdaptiveTopKSelector(k_base=2048)`, `ValueGate` (G2) + `OutputGate` (G1)
 
 ---
 
@@ -33,21 +43,23 @@ Where: `B` = batch, `T` = sequence length, `D` = hidden dimension, `H` = attenti
 ```
 Input [B,T,D]
   |
-  +---> Q_proj(D,D) ---> Conv1D(k=4) ---> RoPE ---> L2 Normalize
-  +---> K_proj(D,D) ---> Conv1D(k=4) ---> RoPE ---> L2 Normalize
-  +---> V_proj(D,D) ---> Conv1D(k=4)
-  +---> G_proj(D,D) (gate for output norm)
-  +---> beta_proj(D,H) ---> sigmoid  (write gate)
-  +---> gk_proj(D,H) ---> softplus ---> exp(-A * ...) = alpha  (decay gate)
+  +---> Q_proj(D, D*0.75) ---> Conv1D(k=4,SiLU) ---> RoPE ---> L2 Normalize ---> scale by d_k^(-0.5)
+  +---> K_proj(D, D*0.75) ---> Conv1D(k=4,SiLU) ---> RoPE ---> L2 Normalize
+  +---> V_proj(D, D*1.5)  ---> Conv1D(k=4,SiLU)
+  +---> G_proj(D, D*1.5)  (gate for output norm)
+  +---> beta_proj(D, H) ---> sigmoid  (write gate)
+  +---> gk_proj(D, H) ---> -A.exp() * softplus(gk + dt_bias)  (log-decay gate, Mamba-style)
   |
   v
-  Delta Rule Recurrence (sequential over T):
+  Delta Rule Recurrence (ref: recurrent_gated_delta_rule_ref, sequential over T):
     for t = 0..T-1:
-      o_t = S @ q_t + D * (q_t . k_t) * v_t
-      S   = alpha_t * S @ (I - beta_t * k_t k_t^T) + beta_t * v_t k_t^T
+      S = S * g_t.exp()                          # decay state
+      v_new = (v_t - (S * k_t).sum(-2)) * beta_t # delta: subtract memory readout
+      S = S + k_t @ v_new^T                      # rank-1 state update
+      o_t = q_t @ S                              # query the state
   |
   v
-  RMSNorm + SiLU Gate ---> O_proj(D,D) ---> Output [B,T,D]
+  FusedRMSNormSwishGate(o, g) ---> O_proj(D*1.5, D) ---> Output [B,T,D]
 ```
 
 ### Gated Sparse Attention (GSA)
@@ -55,24 +67,29 @@ Input [B,T,D]
 ```
 Input [B,T,D]
   |
-  +===[Indexer Phase]===+
-  |  W_Iq(D, H_idx*d_idx)  -> q_I [B,T,H_idx,d_idx]
-  |  W_Ik(D, d_idx)        -> k_I [B,T,d_idx]
-  |  W_Iw(D, H_idx)        -> w   [B,T,H_idx]
-  |  gate_bias              -> b   [H_idx]
+  +===[GatedLightningIndexer]===+
+  |  q_proj(D, H_idx*d_idx=256) -> q_I [B,T,4,64]   (per-head queries)
+  |  k_proj(D, d_idx=64)        -> k_I [B,T,64]      (shared keys)
+  |  weight_proj(D, H_idx=4)    -> w   [B,T,4]        (importance weights, +bias)
+  |  bias                       -> b   [4]             (learnable threshold)
   |       |
   |       v
-  |  Gated Indexer: scores = sigmoid(q_I @ k_I^T + b) * sigmoid(w)
-  |  Variance computation -> adaptive k_t
-  |  TopK selection -> sparse indices [B,T,k_limit]
+  |  scores = sum_h( sigmoid(w_h) * sigmoid(q_I_h @ k_I^T * scale + b_h) )
+  |  Causal mask (torch.triu diagonal=1)
+  |  -> indexer_scores [B, T, T]
+  |
+  +===[AdaptiveTopKSelector]===+
+  |  Variance-based adaptive k (k_base=2048, k_min=256, k_max=4096)
+  |  TopK selection -> indices [B, T, k_effective], mask [B, T, k_effective]
   |
   +===[Attention Phase]===+
-  |  W_q(D,D), W_k(D,D), W_v(D,D)
-  |  W_gv(D,D) -> sigmoid -> value gate
-  |  RoPE on Q, K
-  |  Sparse gather + attention using indices
-  |  W_go(D,D) -> sigmoid -> output gate
-  |  O_proj(D,D)
+  |  q_proj(D,D), k_proj(D,D), v_proj(D,D)
+  |  ValueGate (G2): v = v * sigmoid(W_gv @ h + b),  bias_init=0.5
+  |  RoPE on Q, K (standard _rotate_half)
+  |  Sparse gather via _gather_along_seq (5D expand + torch.gather)
+  |  Sparse SDPA: softmax(Q @ K_sel^T / sqrt(d)) @ V_sel
+  |  OutputGate (G1): o = o * sigmoid(W_go @ h + b),  bias_init=0.5
+  |  o_proj(D,D)
   |
   v
   Output [B,T,D]
@@ -82,7 +99,7 @@ Input [B,T,D]
 
 ## Detailed Operations Per Iteration
 
-All counts are in FLOPs (1 multiply-add = 2 FLOPs). Default config: `B=1, T=variable, D=2048, H=16, d=128, conv_size=4`.
+All counts are in FLOPs (1 multiply-add = 2 FLOPs). Default config: `B=1, T=variable, D=2048, H=16, d_k=96, d_v=192, conv_size=4` (GDN uses expand_k=0.75, expand_v=1.5). GSA uses `d=128, d_idx=64, H_idx=4, k_base=2048`.
 
 ### Gated DeltaNet: Operation Breakdown
 
@@ -105,17 +122,14 @@ All counts are in FLOPs (1 multiply-add = 2 FLOPs). Default config: `B=1, T=vari
 | 15 | L2 Normalize K | [B,T,H,d] | 3BTD |
 | 16 | Sigmoid (beta) | [B,T,H] | BTH |
 | 17 | Softplus + exp (alpha) | [B,T,H] | ~3BTH |
-| **18** | **Delta recurrence (per step t):** | | |
-| 18a | `o_t = S @ q_t` | [B,H,d,d] x [B,H,d] | 2BHd^2 |
-| 18b | `(q_t . k_t)` dot product | [B,H,d] | 2BHd |
-| 18c | `D * dot * v_t` (skip connection) | [B,H,d] | 2BHd |
-| 18d | `v_t @ k_t^T` (outer product) | [B,H,d] x [B,H,d] | BHd^2 |
-| 18e | `k_t @ k_t^T` (outer product) | same | BHd^2 |
-| 18f | `I - beta * k_outer` | [B,H,d,d] | 2BHd^2 |
-| 18g | `S @ orthogonal_proj` (mat-mat) | [B,H,d,d] x [B,H,d,d] | **2BHd^3** |
-| 18h | `alpha * result + beta * v_outer` | [B,H,d,d] | 3BHd^2 |
-| | **Subtotal per step** | | **2BHd^3 + ~9BHd^2** |
-| | **Total recurrence (x T steps)** | | **T(2BHd^3 + 9BHd^2)** |
+| **18** | **Delta recurrence per step t (ref: recurrent_gated_delta_rule_ref):** | | |
+| 18a | `S = S * g_t.exp()` (state decay) | [B,H,d_k,d_v] | BH*d_k*d_v |
+| 18b | `(S * k_t).sum(-2)` (memory readout) | [B,H,d_k,d_v] x [B,H,d_k] | 2BH*d_k*d_v |
+| 18c | `v_new = (v_t - readout) * beta_t` | [B,H,d_v] | 2BH*d_v |
+| 18d | `S += k_t @ v_new^T` (rank-1 update) | [B,H,d_k] x [B,H,d_v] | BH*d_k*d_v |
+| 18e | `o_t = q_t @ S` (query state) | [B,H,d_k] x [B,H,d_k,d_v] | 2BH*d_k*d_v |
+| | **Subtotal per step** | | **~6BH*d_k*d_v** |
+| | **Total recurrence (x T steps)** | | **T * 6BH*d_k*d_v** |
 | 19 | RMSNorm on output | [BTH, d] | ~5BTD |
 | 20 | SiLU gate | [BTH, d] | ~2BTD |
 | 21 | Output projection (`o @ W_o`) | [B,T,D] x [D,D] | 2BTD^2 |
@@ -123,35 +137,35 @@ All counts are in FLOPs (1 multiply-add = 2 FLOPs). Default config: `B=1, T=vari
 #### GDN Total FLOPs (one forward pass)
 
 ```
-Projections:      5 * 2BTD^2           = 10BTD^2
-                  + 2 * 2BTDH          = 4BTDH
-Convolutions:     3 * 8BTD             = 24BTD
-RoPE + Norm:      ~25BTD
-Delta recurrence: T * (2BHd^3 + 9BHd^2)
-Output norm+proj: ~7BTD + 2BTD^2       = 12BTD^2 total with projections
+Projections:      Q,K -> D*D*0.75; V,G -> D*D*1.5; O -> D*1.5*D; beta,gk -> D*H
+                  = 2BT(D*D*0.75*2 + D*D*1.5*2 + D*1.5*D) + 4BTDH
+                  ≈ 2BT * D^2 * (1.5 + 3.0 + 1.5) = 12BTD^2
+Convolutions:     Q,K conv(d=D*0.75,k=4) + V conv(d=D*1.5,k=4)
+RoPE + Norm:      ~25BT * D*0.75
+Delta recurrence: T * 6BH * d_k * d_v  (rank-1 update, NOT d^3 matrix multiply)
 
-DOMINANT TERM:  T * 2BHd^3  (recurrence matrix multiply)
+DOMINANT TERM:  T * 6BH * d_k * d_v  (recurrence with rank-1 state updates)
 ```
 
-**Numerical example (B=1, T=4096, D=2048, H=16, d=128):**
+**Numerical example (B=1, T=4096, D=2048, H=16, d_k=96, d_v=192):**
 
 | Component | FLOPs | % of Total |
 |-----------|-------|------------|
-| Linear projections (6 total) | 12 * 2048^2 * 4096 = ~102.8 G | ~6.0% |
-| Delta recurrence | 4096 * 2 * 16 * 128^3 = **~275.4 G** | **~87.6%** |
-| Convolutions | 24 * 4096 * 2048 = ~201 M | <0.1% |
-| RoPE + Norm + Gates | ~25 * 4096 * 2048 = ~210 M | <0.1% |
-| **Total** | **~378 GFLOPs** | |
+| Linear projections (7 total) | ~12 * 2048^2 * 4096 ≈ ~102.8 G | ~54% |
+| Delta recurrence | 4096 * 6 * 16 * 96 * 192 = **~72.5 G** | **~38%** |
+| Convolutions | ~16 * 4096 * 2048 = ~134 M | <0.1% |
+| RoPE + Norm + Gates | ~20 * 4096 * 1536 = ~126 M | <0.1% |
+| **Total** | **~175 GFLOPs** | |
 
 ### Gated Sparse Attention: Operation Breakdown
 
 | # | Operation | Shape Transformation | FLOPs |
 |---|-----------|---------------------|-------|
 | **Indexer Phase** | | | |
-| 1 | W_Iq projection | [B,T,D] x [D, H_idx*d_idx] | 2BT * D * (4*32) = 2BTD*128 |
-| 2 | W_Ik projection | [B,T,D] x [D, d_idx] | 2BTD*32 |
-| 3 | W_Iw projection | [B,T,D] x [D, H_idx] | 2BTD*4 |
-| 4 | Gated indexer QK scores | [B,T,4,32] x [B,T,32] -> [B,4,T,T] | 2BT^2 * H_idx * d_idx |
+| 1 | q_proj (indexer) | [B,T,D] x [D, H_idx*d_idx] | 2BT * D * (4*64) = 2BTD*256 |
+| 2 | k_proj (indexer) | [B,T,D] x [D, d_idx] | 2BTD*64 |
+| 3 | weight_proj (indexer) | [B,T,D] x [D, H_idx] | 2BTD*4 |
+| 4 | Gated indexer QK scores | [B,T,4,64] x [B,T,64] -> [B,4,T,T] | 2BT^2 * H_idx * d_idx |
 | 5 | Sigmoid (scores + bias) | [B,4,T,T] | B * 4 * T^2 |
 | 6 | Sigmoid (weights) + multiply | [B,4,T,T] | B * 4 * T^2 |
 | 7 | Sum across indexer heads | [B,4,T,T] -> [B,T,T] | B * 4 * T^2 |
@@ -178,29 +192,28 @@ DOMINANT TERM:  T * 2BHd^3  (recurrence matrix multiply)
 #### GSA Total FLOPs (one forward pass)
 
 ```
-Indexer projections:  2BTD * (128 + 32 + 4)   = 328BTD
-Indexer QK scores:    2BT^2 * 4 * 32           = 256BT^2
+Indexer projections:  2BTD * (256 + 64 + 4)    = 648BTD
+Indexer QK scores:    2BT^2 * 4 * 64            = 512BT^2
 Indexer overhead:     ~12BT^2
 TopK:                 ~BT^2 * log(k)
-Attention projections: 6 * 2BTD^2              = 12BTD^2
-Sparse attention:      4BTHkd                  = 4BTkD  (since Hd = D)
+Attention projections: 4 * 2BTD^2               = 8BTD^2    (Q,K,V,O)
+Gate projections:      2 * 2BTD^2               = 4BTD^2    (ValueGate, OutputGate)
+Sparse attention:      4BTHkd                   = 4BTkD     (since Hd = D)
 RoPE + gates:         ~15BTD
 
-DOMINANT TERMS:  12BTD^2 (projections)  +  256BT^2 (indexer)  +  4BTkD (sparse attn)
+DOMINANT TERMS:  12BTD^2 (projections+gates)  +  512BT^2 (indexer)  +  4BTkD (sparse attn)
 ```
 
-**Numerical example (B=1, T=4096, D=2048, H=16, d=128, k=512):**
+**Numerical example (B=1, T=4096, D=2048, H=16, d=128, k=2048):**
 
 | Component | FLOPs | % of Total |
 |-----------|-------|------------|
-| Attention projections (6x) | 12 * 2048^2 * 4096 = ~102.8 G | ~59.2% |
-| Indexer QK scores | 256 * 4096^2 = ~4.3 G | ~2.5% |
-| Indexer projections | 328 * 4096 * 2048 = ~2.75 G | ~1.6% |
-| Sparse attention (QK + AV) | 4 * 4096 * 512 * 2048 = ~17.2 G | ~9.9% |
-| TopK selection | ~4096^2 * 10 = ~168 M | <0.1% |
-| **Total** | **~127 GFLOPs** | |
-
-Note: GSA's sparse attention FLOPs are reported as theoretical. The current `pytorch_sparse_attention` returns zeros (see [Correctness Analysis](#correctness-analysis)), so actual measured benchmark numbers for GSA are invalid.
+| Attn + gate projections (6x) | 12 * 2048^2 * 4096 = ~102.8 G | ~48.6% |
+| Indexer QK scores | 512 * 4096^2 = ~8.6 G | ~4.1% |
+| Indexer projections | 648 * 4096 * 2048 = ~5.4 G | ~2.6% |
+| Sparse attention (QK + AV) | 4 * 4096 * 2048 * 2048 = ~68.7 G | ~32.5% |
+| TopK selection | ~4096^2 * 11 = ~184 M | <0.1% |
+| **Total** | **~186 GFLOPs** | |
 
 ---
 
@@ -274,32 +287,26 @@ The minimum operations represent the irreducible compute required by each algori
 
 ### GDN - Theoretical Minimum
 
-The delta rule recurrence is mathematically irreducible:
+The current implementation already uses the **optimal rank-1 update** formulation (matching the NVlabs reference `recurrent_gated_delta_rule_ref`):
 
 ```
-Per timestep (minimum required):
-  - Read q_t, k_t, v_t, alpha_t, beta_t:      5 * BHd reads
-  - o_t = S @ q_t:                              2BHd^2  FLOPs
-  - S update (rank-1 + decay):                  2BHd^2  FLOPs (using Woodbury/rank-1 update)
-  - Write o_t, S:                               BHd + BHd^2 writes
+Per timestep (irreducible operations):
+  - Decay state: S *= g_t.exp()                  BH * d_k * d_v  FLOPs
+  - Memory readout: (S * k_t).sum(-2)             2BH * d_k * d_v  FLOPs
+  - Delta: v_new = (v_t - readout) * beta_t       2BH * d_v  FLOPs
+  - Rank-1 update: S += k_t @ v_new^T             BH * d_k * d_v  FLOPs
+  - Query state: o_t = q_t @ S                    2BH * d_k * d_v  FLOPs
 
-Minimum per step:   4BHd^2 FLOPs  (with optimized rank-1 state update)
-Minimum total:      4BTHd^2 FLOPs
+Minimum per step:   ~6BH * d_k * d_v  FLOPs
+Minimum total:      6BTH * d_k * d_v  FLOPs
 ```
 
-**Key insight:** The `S @ orthogonal_proj` (d x d matrix multiply, costing 2BHd^3 per step) in the current implementation is NOT the minimum. Using the **Woodbury identity** or **rank-1 update formulation**, the state update can be rewritten as:
+**The reference implementation is already at the theoretical minimum** for a sequential recurrence. The only further optimization is **chunk-parallel** execution (as in `chunk_gated_delta_rule` from the reference), which groups C timesteps into a chunk, computes intra-chunk attention in parallel, and propagates state between chunks.
 
-```
-S' = alpha * S - alpha * beta * S @ (k_t @ k_t^T) + beta * (v_t @ k_t^T)
-   = alpha * S - alpha * beta * (S @ k_t) @ k_t^T + beta * v_t @ k_t^T
-```
-
-This avoids the d x d matrix multiply entirely, replacing it with two matrix-vector products (`S @ k_t` costs 2BHd^2) and two outer products (BHd^2 each).
-
-| Version | Per-step FLOPs | Total (T=4096) | Speedup |
-|---------|---------------|----------------|---------|
-| Current (mat-mat) | 2BHd^3 + 9BHd^2 = ~70.6M | ~289 G | 1x |
-| **Optimized (rank-1)** | ~8BHd^2 = ~33.6M | **~137 G** | **~2.1x** |
+| Version | Per-step FLOPs | Total (T=4096, d_k=96, d_v=192) |
+|---------|---------------|----------------|
+| **Recurrent (current, matches ref)** | 6BH*d_k*d_v = ~1.77M | **~72.5 G** |
+| Chunk-parallel (ref: chunk_gated_delta_rule) | Same total FLOPs, but parallelizable | Same, ~10-50x faster wall-clock |
 
 ### GSA - Theoretical Minimum
 
@@ -336,68 +343,68 @@ Minimum total: 12BTD^2 + 256BT^2 + 4BTkD
 
 ### Cross-Model Comparison: Minimum Ops
 
-| Metric | GDN (optimized) | GSA (current) |
+| Metric | GDN (ref-aligned) | GSA (ref-aligned) |
 |--------|-----------------|---------------|
-| FLOPs at T=4096 | ~137 G | ~127 G |
-| FLOPs at T=16384 | ~549 G | ~567 G (indexer dominates) |
-| **Crossover point** | ~T=12000 | ~T=12000 |
+| FLOPs at T=4096 | ~175 G | ~186 G |
+| Scaling with T | Linear (projections dominate) | Quadratic (indexer T^2) |
 | Parallelism | Sequential (T steps) | Fully parallel |
-| Memory (activation) | O(BHd^2) constant | O(BT^2) quadratic |
+| Memory (activation) | O(BH*d_k*d_v) constant | O(BT^2) quadratic |
+| Reference kernel | `chunk_gated_delta_rule` (Triton) | `triton_sparse_attention` + `triton_gated_indexer` |
 
 ---
 
-## Correctness Analysis (All Fixed)
+## Correctness Analysis
 
-The following bugs were identified and have been fixed in the notebook:
+### Original Bugs (All Fixed via Reference Alignment)
 
-### BUG 1 (Critical) - FIXED: `pytorch_sparse_attention` Was Returning All Zeros
+The original implementation had 5 bugs that were resolved by rewriting the code to match the reference repositories:
 
-**What was wrong:** The sparse attention fallback returned `torch.zeros(...)` instead of computing actual attention, making all GSA outputs zero and benchmark results invalid.
+| Bug | Severity | Root Cause | Resolution |
+|-----|----------|------------|------------|
+| `pytorch_sparse_attention` returned zeros | Critical | Stub implementation | Rewrote to match `gsa/kernels/triton_sparse_attn.py -> _pytorch_sparse_attention()` using 5D gather |
+| Variance on masked values | Medium | Naive `-inf` -> `0.0` replacement | Rewrote as `AdaptiveTopKSelector._compute_adaptive_k()` matching reference |
+| Redundant `torch.no_grad()` | Minor | Oversight | Removed; added `model.eval()` |
+| RoPE concat instead of interleave | Minor | Non-standard rotation | Replaced with standard `_rotate_half` + `apply_rotary_pos_emb` matching both refs |
+| `variance_ema` never used | Medium | Disconnected buffer | Eliminated; using `AdaptiveTopKSelector` module matching reference |
 
-**Fix applied:** Implemented full sparse gather-and-attend using `torch.gather` to select K,V by indices, `einsum` for QK scores and weighted sum, with proper masking and softmax.
+### Current Implementation Verification
 
-### BUG 2 (Medium) - FIXED: Variance Computed on Masked Values
+Both models now match their reference repos:
 
-**What was wrong:** Replacing `-inf` with `0.0` before `var()` inflated variance for early positions where most keys are causally masked.
+**GDN verification points:**
+- Delta rule formula matches `recurrent_gated_delta_rule_ref` exactly: `S *= g.exp(); v_new = (v - (S*k).sum(-2)) * beta; S += k @ v_new^T; o = q @ S`
+- Mamba-style gating: `gk = -A_log.exp() * softplus(gk + dt_bias)`
+- `expand_k=0.75`, `expand_v=1.5` asymmetric key/value dimensions
+- `FusedRMSNormSwishGate` output normalization
 
-**Fix applied:** Variance is now computed only over valid (non-masked) entries using correct count-based denominator.
-
-### BUG 3 (Minor) - FIXED: Redundant `torch.no_grad()` in Benchmark
-
-**What was wrong:** `with torch.no_grad()` was used despite gradients already being globally disabled.
-
-**Fix applied:** Removed redundant context manager. Added `model.eval()` for proper batch norm / dropout behavior.
-
-### BUG 4 (Minor) - FIXED: RoPE Concatenation Instead of Interleaving
-
-**What was wrong:** Rotated pairs were concatenated as `[all_first_halves, all_second_halves]` instead of interleaved `[pair0_a, pair0_b, pair1_a, pair1_b, ...]`.
-
-**Fix applied:** Uses `torch.stack(..., dim=-1).flatten(-2)` to properly interleave the rotated dimensions. Splits input into first/second halves instead of even/odd indices.
-
-### BUG 5 (Medium) - FIXED: GSA `variance_ema` Buffer Never Used
-
-**What was wrong:** `variance_ema` buffer was registered but `None` was passed to `fused_indexer_topk`, so adaptive-k used global mean instead of a stabilized EMA.
-
-**Fix applied:** `self.variance_ema` is now passed to `fused_indexer_topk`. Added EMA update logic during training with momentum=0.1.
+**GSA verification points:**
+- `GatedLightningIndexer` with `d_indexer=64`, xavier init (gain=1.0/0.1)
+- `AdaptiveTopKSelector` with variance-based method, `k_base=2048`
+- `ValueGate` (G2) and `OutputGate` (G1) with `bias_init=0.5`
+- Sparse gather via `_gather_along_seq` pattern (5D expand + `torch.gather`)
+- Indices shape `[B, T, k_selected]` shared across attention heads
 
 ---
 
 ## Benchmark Configuration
 
-| Parameter | Value |
-|-----------|-------|
-| Batch size | 1 |
-| Sequence lengths | 1024, 2048, 4096, 8192 |
-| Hidden dimension | 2048 |
-| Attention heads (both models) | 16 |
-| Head dimension | 128 |
-| Indexer heads (GSA) | 4 |
-| Indexer dimension (GSA) | 32 |
-| Conv kernel size (GDN) | 4 |
-| Warmup iterations | 5 |
-| Timed iterations | 10 |
-| Dtype | bfloat16 |
-| Gradients | Disabled |
+| Parameter | GDN | GSA |
+|-----------|-----|-----|
+| Batch size | 1 | 1 |
+| Sequence lengths | 1024, 2048, 4096, 8192 | 1024, 2048, 4096, 8192 |
+| Hidden dimension | 2048 | 2048 |
+| Attention heads | 16 | 16 |
+| Key head dim (d_k) | 96 (expand_k=0.75) | 128 (D/H) |
+| Value head dim (d_v) | 192 (expand_v=1.5) | 128 (D/H) |
+| Indexer heads | - | 4 |
+| Indexer dimension | - | 64 |
+| k_base / k_min / k_max | - | 2048 / 256 / 4096 |
+| Conv kernel size | 4 | - |
+| Value gate (G2) | - | Yes (bias_init=0.5) |
+| Output gate (G1) | - | Yes (bias_init=0.5) |
+| Warmup / Timed iterations | 5 / 10 | 5 / 10 |
+| Dtype | bfloat16 | bfloat16 |
+| Gradients | Disabled | Disabled |
 
 ### Metrics
 
@@ -440,6 +447,6 @@ Two plots are generated: Throughput vs Sequence Length and Memory vs Sequence Le
 
 ### Important Caveats
 
-1. **GDN uses a Python loop** for the recurrence. Real-world implementations use fused Triton/CUDA kernels that are 10-100x faster. The benchmark measures the algorithm's *relative* scaling behavior, not absolute production performance.
-2. **The GDN recurrence can be optimized** from O(Td^3) to O(Td^2) per head using rank-1 state updates (see [Theoretical Minimum Operations](#theoretical-minimum-operations)).
-3. **GSA sparse attention** uses a PyTorch gather-based fallback that is slower than a fused Triton kernel would be. The throughput numbers reflect this overhead.
+1. **GDN uses a Python loop** (`recurrent_gated_delta_rule_ref`) for the recurrence. The reference repo uses `chunk_gated_delta_rule` with Triton kernels for 10-100x faster execution. The benchmark measures the algorithm's *relative* scaling behavior, not absolute production performance.
+2. **GSA sparse attention** uses a PyTorch `gather`-based fallback matching the reference `_pytorch_sparse_attention`. The reference repo also provides `triton_sparse_attention` and `triton_gated_indexer` kernels for GPU-optimized execution.
+3. **Both implementations are aligned** with their reference repos in terms of architecture, tensor shapes, gating formulas, and mathematical operations. Only the kernel backends differ (PyTorch vs Triton).
