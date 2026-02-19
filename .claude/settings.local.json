@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3:*)",
+      "Bash(git -C /c/Users/ssuga/nirmalp/GSA_GDN_BenchmarkStudy log --oneline -5)",
+      "Bash(where:*)",
+      "Bash(nvcc:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pip show:*)",
+      "Bash(python:*)",
+      "Bash(uv pip list:*)"
     ]
   }
 }
