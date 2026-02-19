@@ -6,9 +6,11 @@ Triton-optimized implementation of [Gated Sparse Attention](https://github.com/a
 
 ```bash
 cd gsa_triton
-uv run benchmark.py                    # verify + benchmark
-uv run benchmark.py --skip-verify      # benchmark only
+uv run benchmark.py                    # verify correctness + full benchmark
+uv run benchmark.py --skip-verify      # benchmark only (skip correctness check)
 uv run benchmark.py --verify-T 256     # smaller verification seq len
+uv run benchmark.py --dtype fp32       # use float32 instead of bfloat16
+uv run benchmark.py --atol 0.2         # relax numerical tolerance
 ```
 
 ## Files
@@ -17,7 +19,125 @@ uv run benchmark.py --verify-T 256     # smaller verification seq len
 |---|---|
 | `gsa_ref.py` | Pure PyTorch reference GSA (correctness baseline) |
 | `gsa_opt.py` | Triton-optimized GSA (two fused kernels + autotune) |
-| `benchmark.py` | Numerical verification + throughput/memory benchmark |
+| `benchmark.py` | Numerical verification + throughput/memory benchmark + profiling entry point |
+
+---
+
+## Profiling
+
+Both `gsa_ref.py` and `gsa_opt.py` contain NVTX range annotations around every logical step of the forward pass. These appear in both Nsight Systems (timeline rows) and Nsight Compute (kernel context panel).
+
+### NVTX ranges emitted
+
+| Range | ref | opt |
+|---|---|---|
+| `gsa_ref/qkv_proj` | yes | — |
+| `gsa_ref/value_gate` | yes | — |
+| `gsa_ref/rotary_emb` | yes | — |
+| `gsa_ref/indexer` | yes | — |
+| `gsa_ref/topk_select` | yes | — |
+| `gsa_ref/sparse_attn` | yes | — |
+| `gsa_ref/output_gate` | yes | — |
+| `gsa_ref/o_proj` | yes | — |
+| `gsa_opt/qkv_proj` | — | yes |
+| `gsa_opt/value_gate` | — | yes |
+| `gsa_opt/rotary_emb` | — | yes |
+| `gsa_opt/indexer` | — | yes |
+| `gsa_opt/topk_select` | — | yes |
+| `gsa_opt/sparse_attn` | — | yes |
+| `gsa_opt/output_gate` | — | yes |
+| `gsa_opt/o_proj` | — | yes |
+| `gsa_opt/triton_gated_indexer_kernel` | — | yes (inside indexer) |
+| `gsa_opt/triton_sparse_attn_kernel` | — | yes (inside sparse_attn) |
+
+---
+
+### Nsight Systems (`nsys`)
+
+`benchmark.py --profile` runs warmup outside the capture window, then calls `cudaProfilerStart()` / `cudaProfilerStop()` around `PROFILE_ITERS=3` forward passes per model.
+
+```bash
+# Both ref and opt (sequential, same report)
+nsys profile --trace=cuda,nvtx --capture-range=cudaProfilerApi \
+    -o gsa_profile \
+    uv run benchmark.py --profile --profile-T 2048
+
+# Reference only
+nsys profile --trace=cuda,nvtx --capture-range=cudaProfilerApi \
+    -o gsa_ref_profile \
+    uv run benchmark.py --profile --profile-ref-only --profile-T 2048
+
+# Optimised only
+nsys profile --trace=cuda,nvtx --capture-range=cudaProfilerApi \
+    -o gsa_opt_profile \
+    uv run benchmark.py --profile --profile-opt-only --profile-T 2048
+```
+
+`--profile` flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--profile` | — | Enable nsys mode |
+| `--profile-T` | 2048 | Sequence length |
+| `--profile-B` | 1 | Batch size |
+| `--profile-ref-only` | false | Capture ref model only |
+| `--profile-opt-only` | false | Capture opt model only |
+
+Open the resulting `.nsys-rep` in the Nsight Systems GUI.
+
+---
+
+### Nsight Compute (`ncu`)
+
+`benchmark.py --ncu` performs the same warmup then captures **exactly one forward pass** per model. NCU replays each kernel many times internally to collect roofline / memory / compute metrics, so minimizing kernels in the capture window is critical.
+
+```bash
+# Reference only — all kernels
+ncu --target-processes all --profile-from-start off \
+    --replay-mode application --set full \
+    -o gsa_ref_ncu \
+    uv run benchmark.py --ncu --ncu-ref-only --ncu-T 2048
+
+# Optimised only — all kernels
+ncu --target-processes all --profile-from-start off \
+    --replay-mode application --set full \
+    -o gsa_opt_ncu \
+    uv run benchmark.py --ncu --ncu-opt-only --ncu-T 2048
+
+# Optimised only — Triton kernels only (faster, skips cuBLAS replays)
+ncu --target-processes all --profile-from-start off \
+    --replay-mode application --set full \
+    --kernel-name regex:"_fused_gated_indexer|_fused_sparse_attn" \
+    -o gsa_opt_triton_ncu \
+    uv run benchmark.py --ncu --ncu-opt-only --ncu-T 2048
+
+# Both ref and opt in one report
+ncu --target-processes all --profile-from-start off \
+    --replay-mode application --set full \
+    -o gsa_both_ncu \
+    uv run benchmark.py --ncu --ncu-T 2048
+```
+
+`--ncu` flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--ncu` | — | Enable ncu mode |
+| `--ncu-T` | 2048 | Sequence length |
+| `--ncu-B` | 1 | Batch size |
+| `--ncu-ref-only` | false | Capture ref model only |
+| `--ncu-opt-only` | false | Capture opt model only |
+
+**Key ncu flags explained:**
+
+| Flag | Purpose |
+|---|---|
+| `--profile-from-start off` | Wait for `cudaProfilerStart()` instead of capturing from process start. This is ncu's equivalent of nsys `--capture-range=cudaProfilerApi`. |
+| `--replay-mode application` | Re-run the entire forward pass for each metric section. Required for Triton kernels — kernel-level replay can corrupt Triton's JIT state. |
+| `--set full` | Collect the full set of hardware metrics (roofline, memory throughput, compute throughput, occupancy, warp stall reasons). Use `--set default` for a faster lighter pass. |
+| `--kernel-name regex:...` | Restrict collection to matching kernel names. Use to focus on the two Triton kernels and skip cuBLAS. |
+
+Open the resulting `.ncu-rep` in the Nsight Compute GUI. To focus on the Triton kernels, filter by `_fused_gated_indexer_kernel` or `_fused_sparse_attn_kernel` in the kernel list.
 
 ---
 

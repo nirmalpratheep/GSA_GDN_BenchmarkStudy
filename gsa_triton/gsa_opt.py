@@ -15,6 +15,15 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
+# NVTX is bundled with PyTorch's CUDA build; fall back to no-ops if unavailable.
+try:
+    from torch.cuda import nvtx as _nvtx
+    _nvtx_push = _nvtx.range_push
+    _nvtx_pop  = _nvtx.range_pop
+except Exception:
+    def _nvtx_push(msg: str): pass
+    def _nvtx_pop(): pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Triton Kernel 1: Fused Gated Indexer
@@ -146,6 +155,7 @@ def fused_gated_indexer(
         triton.cdiv(T, meta["BLOCK_K"]),
     )
 
+    _nvtx_push("gsa_opt/triton_gated_indexer_kernel")
     _fused_gated_indexer_kernel[grid](
         q_idx, k_idx, w, bias, out,
         # Q strides
@@ -159,6 +169,7 @@ def fused_gated_indexer(
         # Dims
         T=T, D_IDX=D_IDX, N_HEADS=N_H, scale=scale, CAUSAL=causal,
     )
+    _nvtx_pop()
     return out
 
 
@@ -172,8 +183,10 @@ def fused_gated_indexer(
 
 @triton.autotune(
     configs=[
+        triton.Config({"BLOCK_T": 8, "BLOCK_K": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_T": 16, "BLOCK_K": 32}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_T": 16, "BLOCK_K": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_T": 16, "BLOCK_K": 128}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_T": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_T": 32, "BLOCK_K": 64}, num_warps=8, num_stages=2),
     ],
@@ -211,18 +224,19 @@ def _fused_sparse_attn_kernel(
     BLOCK_K: tl.constexpr,
 ):
     """
-    Fused sparse attention with online softmax.
+    Fused sparse attention with per-key online softmax.
 
     Grid: (B * H, ceil(T / BLOCK_T))
     Each program handles BLOCK_T query positions for one (batch, head).
 
     Algorithm:
-      For each query position, iterate over K_SEL selected keys in
-      chunks of BLOCK_K. Uses online softmax (FlashAttention-style)
-      to avoid materializing the full attention weight matrix.
+      For each query position, iterate over K_SEL selected keys one at a
+      time (in chunks of BLOCK_K for loop unrolling). Each key triggers a
+      single-element online softmax update: gather K, dot with Q, update
+      running (m, l, acc), gather V, accumulate — all in one pass.
 
-      Phase 1: Compute scores for BLOCK_K keys (gather K, dot with Q)
-      Phase 2: Update online softmax state (m, l) and accumulate V
+      This eliminates the redundant index loads and [BLOCK_T, BLOCK_K]
+      scores intermediate of the previous 3-phase design.
     """
     pid_bh = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -251,15 +265,12 @@ def _fused_sparse_attn_kernel(
     l_prev = tl.zeros([BLOCK_T], dtype=tl.float32)                # running sum(exp)
     acc = tl.zeros([BLOCK_T, D_HEAD], dtype=tl.float32)           # running weighted V
 
-    # Iterate over selected keys in chunks of BLOCK_K
+    # Iterate over selected keys — single pass per key
     for k_start in range(0, K_SEL, BLOCK_K):
-        # ── Phase 1: Compute scores for this chunk ──
-        scores = tl.full([BLOCK_T, BLOCK_K], float("-inf"), dtype=tl.float32)
-
         for ki in tl.static_range(BLOCK_K):
             ki_abs = k_start + ki
             if ki_abs < K_SEL:
-                # Load index for each query: idx[b, t, ki_abs]
+                # ── 1. Load index (once) ──
                 idx_col = tl.load(
                     IDX_ptr
                     + pid_b * stride_ib
@@ -270,7 +281,7 @@ def _fused_sparse_attn_kernel(
                 )
                 idx_col = tl.minimum(tl.maximum(idx_col, 0), T_KV - 1)
 
-                # Gather K: K[b, idx, h, :] -> [BLOCK_T, D_HEAD]
+                # ── 2. Gather K and compute dot product ──
                 k_ptrs = (
                     K_ptr
                     + pid_b * stride_kb
@@ -279,12 +290,10 @@ def _fused_sparse_attn_kernel(
                     + d_offs[None, :] * stride_kd
                 )
                 k_vec = tl.load(k_ptrs, mask=t_mask[:, None], other=0.0).to(tl.float32)
-
-                # Dot product: [BLOCK_T]
-                dot = tl.sum(q_block * k_vec, axis=1) * scale
+                s_ki = tl.sum(q_block * k_vec, axis=1) * scale  # [BLOCK_T]
 
                 # Apply validity mask
-                mask_col = tl.load(
+                mask_val = tl.load(
                     MASK_ptr
                     + pid_b * stride_mb
                     + t_offs * stride_mt
@@ -292,47 +301,18 @@ def _fused_sparse_attn_kernel(
                     mask=t_mask,
                     other=0,
                 )
-                dot = tl.where(mask_col != 0, dot, float("-inf"))
+                s_ki = tl.where(mask_val != 0, s_ki, float("-inf"))
 
-                # Store score into column ki
-                ki_selector = tl.arange(0, BLOCK_K) == ki
-                scores = tl.where(ki_selector[None, :], dot[:, None], scores)
+                # ── 3. Per-key online softmax update ──
+                m_new = tl.maximum(m_prev, s_ki)
+                alpha = tl.exp(m_prev - m_new)
+                p_ki = tl.exp(s_ki - m_new)
+                p_ki = tl.where(s_ki > float("-inf") + 1.0, p_ki, 0.0)
 
-        # ── Phase 2: Online softmax update ──
-        # Current block max
-        m_cur = tl.max(scores, axis=1)  # [BLOCK_T]
-        m_new = tl.maximum(m_prev, m_cur)
+                l_new = alpha * l_prev + p_ki
+                acc = acc * alpha[:, None]
 
-        # Correction factor for previous accumulator
-        alpha = tl.exp(m_prev - m_new)
-
-        # exp(scores - m_new): [BLOCK_T, BLOCK_K]
-        p = tl.exp(scores - m_new[:, None])
-        # Zero out entries that were -inf (now exp(-inf - m_new) = 0, but be safe)
-        p = tl.where(scores > float("-inf") + 1.0, p, 0.0)
-
-        # Update running sum
-        l_new = alpha * l_prev + tl.sum(p, axis=1)
-
-        # Rescale previous accumulator
-        acc = acc * alpha[:, None]
-
-        # ── Accumulate V weighted by p for this chunk ──
-        for ki in tl.static_range(BLOCK_K):
-            ki_abs = k_start + ki
-            if ki_abs < K_SEL:
-                # Reload index (compiler should optimize redundant loads)
-                idx_col = tl.load(
-                    IDX_ptr
-                    + pid_b * stride_ib
-                    + t_offs * stride_it
-                    + ki_abs * stride_ik,
-                    mask=t_mask,
-                    other=0,
-                )
-                idx_col = tl.minimum(tl.maximum(idx_col, 0), T_KV - 1)
-
-                # Gather V: V[b, idx, h, :] -> [BLOCK_T, D_HEAD]
+                # ── 4. Gather V and accumulate ──
                 v_ptrs = (
                     V_ptr
                     + pid_b * stride_vb
@@ -341,15 +321,10 @@ def _fused_sparse_attn_kernel(
                     + d_offs[None, :] * stride_vd
                 )
                 v_vec = tl.load(v_ptrs, mask=t_mask[:, None], other=0.0).to(tl.float32)
-
-                # Extract p[:, ki] -> [BLOCK_T]
-                ki_selector = tl.arange(0, BLOCK_K) == ki
-                p_ki = tl.sum(tl.where(ki_selector[None, :], p, 0.0), axis=1)
-
                 acc += p_ki[:, None] * v_vec
 
-        m_prev = m_new
-        l_prev = l_new
+                m_prev = m_new
+                l_prev = l_new
 
     # Final normalization: acc / l
     safe_l = tl.where(l_prev > 0, l_prev, 1.0)
@@ -389,6 +364,7 @@ def fused_sparse_attention(
 
     grid = lambda meta: (B * H, triton.cdiv(T, meta["BLOCK_T"]))
 
+    _nvtx_push("gsa_opt/triton_sparse_attn_kernel")
     _fused_sparse_attn_kernel[grid](
         q, k, v, indices, mask, out,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -399,6 +375,7 @@ def fused_sparse_attention(
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         T=T, T_KV=k.shape[1], H=H, K_SEL=K_SEL, D_HEAD=D, scale=scale,
     )
+    _nvtx_pop()
     return out
 
 
@@ -567,30 +544,49 @@ class GatedSparseAttention(nn.Module):
         B, T, D = x.shape
 
         # Step 1: QKV projections
+        _nvtx_push("gsa_opt/qkv_proj")
         q = self.q_proj(x).view(B, T, self.num_heads, self.d_head)
         k = self.k_proj(x).view(B, T, self.num_heads, self.d_head)
         v = self.v_proj(x).view(B, T, self.num_heads, self.d_head)
+        _nvtx_pop()
 
         # Step 2: Value Gate (G2)
+        _nvtx_push("gsa_opt/value_gate")
         v = self.value_gate(v, x)
+        _nvtx_pop()
 
         # Step 3: RoPE
+        _nvtx_push("gsa_opt/rotary_emb")
         cos, sin = self.rotary_emb(T, x.device, x.dtype)
         cos = cos.unsqueeze(0).unsqueeze(2)
         sin = sin.unsqueeze(0).unsqueeze(2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        _nvtx_pop()
 
         # Step 4: Fused Gated Indexer (Triton)
+        _nvtx_push("gsa_opt/indexer")
         indexer_scores = self.indexer(x)
+        _nvtx_pop()
 
-        # Step 5: Top-K selection
+        # Step 5: Top-K selection + sort for L2 cache locality
+        _nvtx_push("gsa_opt/topk_select")
         indices, mask, k_eff = self.topk_selector(indexer_scores)
+        indices, sort_order = torch.sort(indices, dim=-1)
+        mask = torch.gather(mask, -1, sort_order)
+        _nvtx_pop()
 
         # Step 6: Fused Sparse Attention (Triton)
+        _nvtx_push("gsa_opt/sparse_attn")
         attn_out = fused_sparse_attention(q, k, v, indices, mask, self.scale)
+        _nvtx_pop()
 
         # Step 7: Output Gate (G1)
+        _nvtx_push("gsa_opt/output_gate")
         attn_out = self.output_gate(attn_out, x)
+        _nvtx_pop()
 
         # Step 8: Output projection
-        return self.o_proj(attn_out.reshape(B, T, D))
+        _nvtx_push("gsa_opt/o_proj")
+        out = self.o_proj(attn_out.reshape(B, T, D))
+        _nvtx_pop()
+        return out

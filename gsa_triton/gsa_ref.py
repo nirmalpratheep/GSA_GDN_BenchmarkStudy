@@ -14,6 +14,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+# NVTX is bundled with PyTorch's CUDA build; fall back to no-ops if unavailable.
+try:
+    from torch.cuda import nvtx as _nvtx
+    _nvtx_push = _nvtx.range_push
+    _nvtx_pop  = _nvtx.range_pop
+except Exception:
+    def _nvtx_push(msg: str): pass
+    def _nvtx_pop(): pass
+
 
 # ── Rotary Position Embeddings ─────────────────────────────────────────────
 
@@ -270,30 +279,47 @@ class GatedSparseAttention(nn.Module):
         B, T, D = x.shape
 
         # Step 1: QKV projections
+        _nvtx_push("gsa_ref/qkv_proj")
         q = self.q_proj(x).view(B, T, self.num_heads, self.d_head)
         k = self.k_proj(x).view(B, T, self.num_heads, self.d_head)
         v = self.v_proj(x).view(B, T, self.num_heads, self.d_head)
+        _nvtx_pop()
 
         # Step 2: Value Gate (G2)
+        _nvtx_push("gsa_ref/value_gate")
         v = self.value_gate(v, x)
+        _nvtx_pop()
 
         # Step 3: RoPE on Q, K
+        _nvtx_push("gsa_ref/rotary_emb")
         cos, sin = self.rotary_emb(T, x.device, x.dtype)
         cos = cos.unsqueeze(0).unsqueeze(2)  # [1, T, 1, d_head]
         sin = sin.unsqueeze(0).unsqueeze(2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        _nvtx_pop()
 
         # Step 4: Indexer scoring
+        _nvtx_push("gsa_ref/indexer")
         indexer_scores = self.indexer(x)
+        _nvtx_pop()
 
         # Step 5: Top-K selection
+        _nvtx_push("gsa_ref/topk_select")
         indices, mask, k_eff = self.topk_selector(indexer_scores)
+        _nvtx_pop()
 
         # Step 6: Sparse attention
+        _nvtx_push("gsa_ref/sparse_attn")
         attn_out = sparse_attention_ref(q, k, v, indices, mask, self.scale)
+        _nvtx_pop()
 
         # Step 7: Output Gate (G1)
+        _nvtx_push("gsa_ref/output_gate")
         attn_out = self.output_gate(attn_out, x)
+        _nvtx_pop()
 
         # Step 8: Output projection
-        return self.o_proj(attn_out.reshape(B, T, D))
+        _nvtx_push("gsa_ref/o_proj")
+        out = self.o_proj(attn_out.reshape(B, T, D))
+        _nvtx_pop()
+        return out
