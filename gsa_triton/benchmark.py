@@ -116,6 +116,7 @@ def verify_numerical_match(
     # Copy weights: both modules have identical state_dict keys
     ref_sd = ref_model.state_dict()
     opt_model.load_state_dict(ref_sd, strict=True)
+    opt_model.fuse_projections()  # build fused mega-GEMM weight
 
     x = torch.randn(1, seq_len, GSA_KWARGS["hidden_size"], device=device, dtype=dtype)
 
@@ -165,6 +166,8 @@ def benchmark_model(
 
         try:
             model = model_cls(**kwargs).to(device).to(dtype).eval()
+            if hasattr(model, "fuse_projections"):
+                model.fuse_projections()
             x = torch.randn(B, T, D, device=device, dtype=dtype)
 
             # Warmup
@@ -302,6 +305,8 @@ def run_profile(
     if run_ref and run_opt:
         # Share weights so the two models are equivalent
         opt_model.load_state_dict(ref_model.state_dict(), strict=True)
+    if opt_model is not None:
+        opt_model.fuse_projections()
 
     x = torch.randn(B, T, D, device=device, dtype=dtype)
 
@@ -382,6 +387,8 @@ def run_ncu(
     opt_model = gsa_opt.GatedSparseAttention(**kwargs).to(device).to(dtype).eval() if run_opt else None
     if run_ref and run_opt:
         opt_model.load_state_dict(ref_model.state_dict(), strict=True)
+    if opt_model is not None:
+        opt_model.fuse_projections()
 
     x = torch.randn(B, T, D, device=device, dtype=dtype)
 

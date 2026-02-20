@@ -20,9 +20,11 @@ try:
     from torch.cuda import nvtx as _nvtx
     _nvtx_push = _nvtx.range_push
     _nvtx_pop  = _nvtx.range_pop
+    _nvtx_mark = _nvtx.mark
 except Exception:
     def _nvtx_push(msg: str): pass
     def _nvtx_pop(): pass
+    def _nvtx_mark(msg: str): pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -155,6 +157,7 @@ def fused_gated_indexer(
         triton.cdiv(T, meta["BLOCK_K"]),
     )
 
+    _nvtx_mark("kernel_launch/fused_gated_indexer")
     _nvtx_push("gsa_opt/triton_gated_indexer_kernel")
     _fused_gated_indexer_kernel[grid](
         q_idx, k_idx, w, bias, out,
@@ -364,6 +367,7 @@ def fused_sparse_attention(
 
     grid = lambda meta: (B * H, triton.cdiv(T, meta["BLOCK_T"]))
 
+    _nvtx_mark("kernel_launch/fused_sparse_attn")
     _nvtx_push("gsa_opt/triton_sparse_attn_kernel")
     _fused_sparse_attn_kernel[grid](
         q, k, v, indices, mask, out,
@@ -507,8 +511,24 @@ class OutputGate(nn.Module):
 
 class GatedSparseAttention(nn.Module):
     """
-    Triton-optimized Gated Sparse Attention.
+    Triton-optimized Gated Sparse Attention with pipelined execution.
     Drop-in replacement for gsa_ref.GatedSparseAttention.
+
+    Pipeline architecture (dependency-aware):
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Phase 1: FUSED MEGA-GEMM                                      │
+    │  Single matmul for all 8 projections on x:                      │
+    │  q, k, v, vgate, ogate, idx_q, idx_k, idx_w                    │
+    │  (1 kernel launch instead of 8, x read from GMEM once)          │
+    ├──────────────────────┬──────────────────────────────────────────┤
+    │  Phase 2a (Stream 1) │  Phase 2b (Default Stream)              │
+    │  Indexer pipeline:   │  QKV post-processing:                   │
+    │  ├─ fused indexer    │  ├─ value gate sigmoid + apply          │
+    │  ├─ topk selection   │  ├─ RoPE on Q, K                       │
+    │  └─ index sort       │  └─ output gate sigmoid (precompute)    │
+    ├──────────────────────┴──────────────────────────────────────────┤
+    │  Phase 3: CONVERGE → Sparse Attention + Output Gate + O-proj   │
+    └─────────────────────────────────────────────────────────────────┘
     """
 
     def __init__(
@@ -527,66 +547,177 @@ class GatedSparseAttention(nn.Module):
         self.d_head = hidden_size // num_heads
         self.scale = self.d_head ** -0.5
 
+        # Attention projections
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
+        # Sub-modules (kept for state_dict compatibility with ref)
         self.indexer = GatedLightningIndexer(hidden_size, d_indexer, n_idx_heads)
         self.topk_selector = AdaptiveTopKSelector(k_base, k_min, k_max)
         self.value_gate = ValueGate(hidden_size)
         self.output_gate = OutputGate(hidden_size)
         self.rotary_emb = RotaryEmbedding(self.d_head)
 
+        # Cached fused weight (built lazily or via fuse_projections())
+        self._fused_weight: Optional[torch.Tensor] = None
+        self._fused_bias: Optional[torch.Tensor] = None
+
+        # Projection slice sizes for splitting the mega-GEMM output
+        self._proj_sizes = [
+            hidden_size,                    # q
+            hidden_size,                    # k
+            hidden_size,                    # v
+            hidden_size,                    # value_gate
+            hidden_size,                    # output_gate
+            n_idx_heads * d_indexer,        # idx_q
+            d_indexer,                      # idx_k
+            n_idx_heads,                    # idx_w
+        ]
+
+        # CUDA stream for indexer pipeline (created lazily)
+        self._indexer_stream: Optional[torch.cuda.Stream] = None
+
+    def fuse_projections(self) -> None:
+        """Pre-build fused weight/bias tensors. Call once after load_state_dict()."""
+        # Fuse all 8 weight matrices: [total_out, hidden_size]
+        self._fused_weight = torch.cat([
+            self.q_proj.weight,                     # [D, D]
+            self.k_proj.weight,                     # [D, D]
+            self.v_proj.weight,                     # [D, D]
+            self.value_gate.gate_proj.weight,       # [D, D]
+            self.output_gate.gate_proj.weight,      # [D, D]
+            self.indexer.idx_q_proj.weight,         # [n_h*d_idx, D]
+            self.indexer.idx_k_proj.weight,         # [d_idx, D]
+            self.indexer.idx_w_proj.weight,         # [n_h, D]
+        ], dim=0)
+
+        # Fuse biases (zero for bias=False projections)
+        total = sum(self._proj_sizes)
+        bias = torch.zeros(total, device=self._fused_weight.device,
+                           dtype=self._fused_weight.dtype)
+        offset = 0
+        for i, sz in enumerate(self._proj_sizes):
+            if i == 3:   # value_gate
+                bias[offset:offset+sz] = self.value_gate.gate_proj.bias
+            elif i == 4:  # output_gate
+                bias[offset:offset+sz] = self.output_gate.gate_proj.bias
+            elif i == 7:  # idx_w
+                bias[offset:offset+sz] = self.indexer.idx_w_proj.bias
+            offset += sz
+        self._fused_bias = bias
+
+    def _get_fused_weight(self):
+        """Lazily build the fused weight if not cached."""
+        if self._fused_weight is None:
+            self.fuse_projections()
+        return self._fused_weight, self._fused_bias
+
     def forward(
         self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, T, D = x.shape
 
-        # Step 1: QKV projections
-        _nvtx_push("gsa_opt/qkv_proj")
-        q = self.q_proj(x).view(B, T, self.num_heads, self.d_head)
-        k = self.k_proj(x).view(B, T, self.num_heads, self.d_head)
-        v = self.v_proj(x).view(B, T, self.num_heads, self.d_head)
-        _nvtx_pop()
+        _nvtx_push("gsa_opt/forward")
 
-        # Step 2: Value Gate (G2)
-        _nvtx_push("gsa_opt/value_gate")
-        v = self.value_gate(v, x)
-        _nvtx_pop()
+        # ══════════════════════════════════════════════════════════════
+        # Phase 1: FUSED MEGA-GEMM
+        # All 8 projections (q, k, v, vgate, ogate, idx_q, idx_k, idx_w)
+        # in a single matmul. Reads x from GMEM once, 1 kernel launch.
+        # ══════════════════════════════════════════════════════════════
+        _nvtx_push("phase1/fused_mega_gemm")
+        fused_w, fused_b = self._get_fused_weight()
+        combined = F.linear(x, fused_w, fused_b)   # [B, T, total_out]
 
-        # Step 3: RoPE
-        _nvtx_push("gsa_opt/rotary_emb")
+        # Split into individual projections (zero-copy views)
+        q_raw, k_raw, v_raw, vg_logit, og_logit, iq_raw, ik_raw, iw_raw = \
+            combined.split(self._proj_sizes, dim=-1)
+        _nvtx_pop()  # phase1/fused_mega_gemm
+
+        # ══════════════════════════════════════════════════════════════
+        # Phase 2: PARALLEL TRACKS (CUDA streams)
+        #
+        #   Stream 1 (indexer_stream):    Stream 0 (default):
+        #   ├─ fused_gated_indexer        ├─ value gate sigmoid + apply
+        #   ├─ topk selection             ├─ RoPE on Q, K
+        #   └─ index sort                 └─ output gate sigmoid
+        # ══════════════════════════════════════════════════════════════
+        _nvtx_mark("phase2/parallel_begin")
+        _nvtx_push("phase2/parallel_tracks")
+
+        # ── Track A: Indexer pipeline (separate stream) ──────────────
+        if self._indexer_stream is None:
+            self._indexer_stream = torch.cuda.Stream(device=x.device)
+
+        with torch.cuda.stream(self._indexer_stream):
+            _nvtx_push("track_A/indexer_stream")
+
+            _nvtx_push("track_A/fused_gated_indexer")
+            iq = iq_raw.view(B, T, self.indexer.n_idx_heads, self.indexer.d_indexer)
+            indexer_scores = fused_gated_indexer(
+                iq.contiguous(), ik_raw.contiguous(), iw_raw.contiguous(),
+                self.indexer.idx_bias, self.indexer.scale, causal=True,
+            )
+            _nvtx_pop()  # track_A/fused_gated_indexer
+
+            _nvtx_push("track_A/topk_select")
+            indices, mask, _ = self.topk_selector(indexer_scores)
+            _nvtx_pop()  # track_A/topk_select
+
+            _nvtx_push("track_A/index_sort")
+            indices, sort_order = torch.sort(indices, dim=-1)
+            mask = torch.gather(mask, -1, sort_order)
+            _nvtx_pop()  # track_A/index_sort
+
+            _nvtx_pop()  # track_A/indexer_stream
+
+        # ── Track B: QKV post-processing (default stream) ────────────
+        _nvtx_push("track_B/default_stream")
+
+        _nvtx_push("track_B/value_gate")
+        q = q_raw.view(B, T, self.num_heads, self.d_head)
+        k = k_raw.view(B, T, self.num_heads, self.d_head)
+        v = v_raw.view(B, T, self.num_heads, self.d_head)
+        v = v * torch.sigmoid(vg_logit).view(B, T, self.num_heads, self.d_head)
+        _nvtx_pop()  # track_B/value_gate
+
+        _nvtx_push("track_B/rope")
         cos, sin = self.rotary_emb(T, x.device, x.dtype)
         cos = cos.unsqueeze(0).unsqueeze(2)
         sin = sin.unsqueeze(0).unsqueeze(2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        _nvtx_pop()
+        _nvtx_pop()  # track_B/rope
 
-        # Step 4: Fused Gated Indexer (Triton)
-        _nvtx_push("gsa_opt/indexer")
-        indexer_scores = self.indexer(x)
-        _nvtx_pop()
+        _nvtx_push("track_B/output_gate_precompute")
+        og_sigmoid = torch.sigmoid(og_logit)
+        _nvtx_pop()  # track_B/output_gate_precompute
 
-        # Step 5: Top-K selection + sort for L2 cache locality
-        _nvtx_push("gsa_opt/topk_select")
-        indices, mask, k_eff = self.topk_selector(indexer_scores)
-        indices, sort_order = torch.sort(indices, dim=-1)
-        mask = torch.gather(mask, -1, sort_order)
-        _nvtx_pop()
+        _nvtx_pop()  # track_B/default_stream
 
-        # Step 6: Fused Sparse Attention (Triton)
-        _nvtx_push("gsa_opt/sparse_attn")
+        _nvtx_pop()  # phase2/parallel_tracks
+
+        # ══════════════════════════════════════════════════════════════
+        # Phase 3: CONVERGE → sync streams, then sparse attention
+        # ══════════════════════════════════════════════════════════════
+        _nvtx_mark("phase3/stream_sync")
+        torch.cuda.current_stream(x.device).wait_stream(self._indexer_stream)
+
+        _nvtx_push("phase3/converge")
+
+        _nvtx_push("phase3/fused_sparse_attn")
         attn_out = fused_sparse_attention(q, k, v, indices, mask, self.scale)
-        _nvtx_pop()
+        _nvtx_pop()  # phase3/fused_sparse_attn
 
-        # Step 7: Output Gate (G1)
-        _nvtx_push("gsa_opt/output_gate")
-        attn_out = self.output_gate(attn_out, x)
-        _nvtx_pop()
+        _nvtx_push("phase3/output_gate_apply")
+        attn_out = attn_out * og_sigmoid.view(B, T, self.num_heads, self.d_head)
+        _nvtx_pop()  # phase3/output_gate_apply
 
-        # Step 8: Output projection
-        _nvtx_push("gsa_opt/o_proj")
+        _nvtx_push("phase3/o_proj")
         out = self.o_proj(attn_out.reshape(B, T, D))
-        _nvtx_pop()
+        _nvtx_pop()  # phase3/o_proj
+
+        _nvtx_pop()  # phase3/converge
+
+        _nvtx_pop()  # gsa_opt/forward
         return out
