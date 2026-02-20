@@ -633,12 +633,16 @@ class GatedSparseAttention(nn.Module):
         # Split into individual projections (zero-copy views)
         q_raw, k_raw, v_raw, vg_logit, og_logit, iq_raw, ik_raw, iw_raw = \
             combined.split(self._proj_sizes, dim=-1)
+        # Record event: mega-GEMM output is ready on default stream
+        mega_gemm_done = torch.cuda.current_stream(x.device).record_event()
         _nvtx_pop()  # phase1/fused_mega_gemm
 
         # ══════════════════════════════════════════════════════════════
         # Phase 2: PARALLEL TRACKS (CUDA streams)
         #
+        # Both tracks wait on mega_gemm_done, then run concurrently:
         #   Stream 1 (indexer_stream):    Stream 0 (default):
+        #   ├─ wait(mega_gemm_done)       │  (already on default — no wait)
         #   ├─ fused_gated_indexer        ├─ value gate sigmoid + apply
         #   ├─ topk selection             ├─ RoPE on Q, K
         #   └─ index sort                 └─ output gate sigmoid
@@ -651,6 +655,8 @@ class GatedSparseAttention(nn.Module):
             self._indexer_stream = torch.cuda.Stream(device=x.device)
 
         with torch.cuda.stream(self._indexer_stream):
+            # Wait for mega-GEMM to finish before reading iq/ik/iw slices
+            self._indexer_stream.wait_event(mega_gemm_done)
             _nvtx_push("track_A/indexer_stream")
 
             _nvtx_push("track_A/fused_gated_indexer")
@@ -673,6 +679,7 @@ class GatedSparseAttention(nn.Module):
             _nvtx_pop()  # track_A/indexer_stream
 
         # ── Track B: QKV post-processing (default stream) ────────────
+        # No wait needed — mega-GEMM ran on this stream, already ordered.
         _nvtx_push("track_B/default_stream")
 
         _nvtx_push("track_B/value_gate")
